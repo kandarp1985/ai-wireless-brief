@@ -1,7 +1,8 @@
 import { NextResponse } from 'next/server'
 import { fetchAllNews } from '@/lib/rss'
 
-// Vercel Cron hits this route to refresh data
+export const runtime = 'nodejs'
+
 export async function GET() {
   try {
     const data = await fetchAllNews()

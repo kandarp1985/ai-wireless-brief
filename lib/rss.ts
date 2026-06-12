@@ -21,7 +21,7 @@ function isRecent(pubDate: string): boolean {
   try {
     const now = new Date()
     const pub = new Date(pubDate)
-    // Guard against future dates (timezone mismatches in RSS feeds)
+    if (isNaN(pub.getTime())) return false
     if (pub > now) return true
     const diffHours = (now.getTime() - pub.getTime()) / (1000 * 60 * 60)
     return diffHours >= 0 && diffHours <= 72
@@ -50,49 +50,99 @@ function shouldSkip(item: { title: string; link: string }): boolean {
   return SKIP_SOURCES.some(s => l.includes(s)) || SKIP_TITLES.some(s => t.includes(s))
 }
 
-function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
-  return Promise.race([
-    promise,
-    new Promise<T>((_, reject) => setTimeout(() => reject(new Error('timeout')), ms))
-  ])
+// Zero-dependency XML parser for RSS 2.0 and Atom feeds
+function extractTag(xml: string, tag: string, index: number): string {
+  // Match the i-th occurrence of <tag>...</tag> (handles newlines)
+  const regex = new RegExp(`<${tag}[^>]*>([\\s\\S]*?)</${tag}>`, 'i')
+  let count = 0
+  let pos = 0
+  while (count < index) {
+    const m = xml.slice(pos).match(regex)
+    if (!m) return ''
+    pos += xml.slice(pos).indexOf(m[0]) + m[0].length
+    count++
+  }
+  const m = xml.slice(0).match(regex)
+  if (!m) return ''
+  // Try to extract again from the beginning with offset tracking
+  let remaining = xml
+  let result = ''
+  for (let i = 0; i < index + 1; i++) {
+    const match = remaining.match(new RegExp(`<${tag}[^>]*>([\\s\\S]*?)</${tag}>`, 'i'))
+    if (!match) return ''
+    if (i === index) {
+      result = match[1]
+    }
+    remaining = remaining.slice(remaining.indexOf(match[0]) + match[0].length)
+  }
+  return result.trim()
 }
 
-async function fetchText(url: string, timeoutMs = 15000): Promise<string> {
-  const resp = await withTimeout(
-    fetch(url, {
-      headers: { 'User-Agent': USER_AGENT },
-      signal: AbortSignal.timeout(timeoutMs),
-    } as RequestInit),
-    timeoutMs
-  )
-  if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
-  return resp.text()
+function getAllTags(xml: string, tag: string): string[] {
+  const regex = new RegExp(`<${tag}[^>]*>([\\s\\S]*?)</${tag}>`, 'gi')
+  const results: string[] = []
+  let match
+  while ((match = regex.exec(xml)) !== null) {
+    results.push(match[1].trim())
+  }
+  return results
 }
 
-function parseRSS(xml: string, source: string): NewsItem[] {
+function parseItem(rawItem: string, source: string): NewsItem | null {
+  // RSS 2.0: <item><title>...</title><link>...</link><pubDate>...</pubDate></item>
+  // Try RSS-style first
+  const titles = getAllTags(rawItem, 'title')
+  const links = getAllTags(rawItem, 'link')
+  const pubDates = getAllTags(rawItem, 'pubDate')
+  // Atom: <entry><title>...</title><link href="..."/><updated>...</updated></entry>
+  const updated = getAllTags(rawItem, 'updated')
+  const authors = getAllTags(rawItem, 'author')
+
+  const title = titles[0] || ''
+  // For Atom, link might be an attribute: <link href="...">
+  let link = links[0] || ''
+  if (!link) {
+    const linkAttrMatch = rawItem.match(/<link[^>]+href=["']([^"']+)["'][^>]*>/i)
+    if (linkAttrMatch) link = linkAttrMatch[1]
+  }
+
+  const pubDate = pubDates[0] || updated[0] || ''
+
+  if (!title || !link) return null
+  if (!isRecent(pubDate)) return null
+  if (shouldSkip({ title, link })) return null
+
+  const category = classifyCategory(title, link)
+  if (!category) return null
+
+  return { title, link, source, category, pubDate }
+}
+
+function parseFeedXML(xml: string, source: string): NewsItem[] {
   const items: NewsItem[] = []
   try {
-    const parser = new DOMParser()
-    const doc = parser.parseFromString(xml, 'text/xml')
-    const entries = doc.querySelectorAll('item, entry')
-    entries.forEach(item => {
-      const titleEl = item.querySelector('title')
-      const linkEl = item.querySelector('link')
-      const pubEl = item.querySelector('pubDate, published, updated')
-      let link = linkEl?.textContent?.trim() || ''
-      if (!link) {
-        const altLink = item.querySelector('link[rel="alternate"]')
-        link = altLink?.getAttribute('href') || ''
+    // Extract channel title to verify this is RSS
+    const channelMatch = xml.match(/<channel[^>]*>([\s\S]*?)<\/channel>/i)
+    if (!channelMatch) return items
+
+    const channelContent = channelMatch[1]
+
+    // Find all <item> blocks
+    const itemRegex = /<item[^>]*>([\s\S]*?)<\/item>/gi
+    let match
+    while ((match = itemRegex.exec(channelContent)) !== null) {
+      const item = parseItem(match[1], source)
+      if (item) items.push(item)
+    }
+
+    // If no RSS items, try Atom <entry> blocks
+    if (items.length === 0) {
+      const entryRegex = /<entry[^>]*>([\s\S]*?)<\/entry>/gi
+      while ((match = entryRegex.exec(xml)) !== null) {
+        const item = parseItem(match[1], source)
+        if (item) items.push(item)
       }
-      const title = titleEl?.textContent?.trim() || ''
-      const pubDate = pubEl?.textContent?.trim() || ''
-      if (!title || !link) return
-      if (!isRecent(pubDate)) return
-      if (shouldSkip({ title, link })) return
-      const category = classifyCategory(title, link)
-      if (!category) return
-      items.push({ title, link, source, category, pubDate })
-    })
+    }
   } catch (e) {
     console.error(`Parse error for ${source}:`, e)
   }
@@ -101,8 +151,13 @@ function parseRSS(xml: string, source: string): NewsItem[] {
 
 async function fetchRSS(name: string, url: string): Promise<NewsItem[]> {
   try {
-    const xml = await fetchText(url, 15000)
-    return parseRSS(xml, name)
+    const resp = await fetch(url, {
+      headers: { 'User-Agent': USER_AGENT },
+      signal: AbortSignal.timeout(15000),
+    } as RequestInit)
+    if (!resp.ok) return []
+    const xml = await resp.text()
+    return parseFeedXML(xml, name)
   } catch (e) {
     console.error(`Failed to fetch ${name}:`, e?.message)
     return []
@@ -111,8 +166,13 @@ async function fetchRSS(name: string, url: string): Promise<NewsItem[]> {
 
 async function fetchHackerNews(): Promise<NewsItem[]> {
   try {
-    const xml = await fetchText('https://news.ycombinator.com/rss', 15000)
-    return parseRSS(xml, 'Hacker News')
+    const resp = await fetch('https://news.ycombinator.com/rss', {
+      headers: { 'User-Agent': USER_AGENT },
+      signal: AbortSignal.timeout(15000),
+    } as RequestInit)
+    if (!resp.ok) return []
+    const xml = await resp.text()
+    return parseFeedXML(xml, 'Hacker News')
   } catch (e) {
     console.error('Failed to fetch HN:', e?.message)
     return []
